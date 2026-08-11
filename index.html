@@ -128,6 +128,14 @@
     border-radius: 8px; font-size: 13px; color: #8a5a00;
   }
   .warnings-box ul { margin: 6px 0 0; padding-left: 18px; }
+  .dual-upload { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-bottom: 6px; }
+  .dropzone-small { padding: 22px 16px; }
+  .dropzone-small .icon { font-size: 26px; }
+  @media (max-width: 700px) { .dual-upload { grid-template-columns: 1fr; } }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11.5px; font-weight: 600; }
+  .badge-exact { background: #e6f6ea; color: #1b7a3d; }
+  .badge-tolerance { background: #fef6e6; color: #8a5a00; }
+  .badge-none { background: #f1f2f4; color: #6b7280; }
 </style>
 </head>
 <body>
@@ -140,6 +148,7 @@
   <div class="tabs">
     <button class="tab-btn active" id="tabBtnEstado" type="button" data-tab="estado">1. Estado de Cuenta</button>
     <button class="tab-btn" id="tabBtnFacturas" type="button" data-tab="facturas">2. Facturas (.zip)</button>
+    <button class="tab-btn" id="tabBtnCruce" type="button" data-tab="cruce">3. Cruce Estado ↔ Facturas</button>
   </div>
 
   <!-- ===================== TAB 1: ESTADO DE CUENTA ===================== -->
@@ -216,6 +225,59 @@
       <div class="actions">
         <button class="btn-primary" id="downloadBtnInv" type="button">Descargar Excel de facturas (.xlsx)</button>
         <button class="btn-secondary" id="resetBtnInv" type="button">Cargar otro .zip</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== TAB 3: CRUCE ESTADO <-> FACTURAS ===================== -->
+  <div class="tab-panel" id="panel-cruce">
+    <div class="card">
+      <h2>Cargar los dos archivos procesados</h2>
+      <p class="muted" style="margin:0 0 16px;">Sube el Excel del estado de cuenta ya procesado (pestaña 1) y el Excel de facturas ya procesado (pestaña 2). Deben cubrir el mismo periodo para que el cruce tenga sentido.</p>
+      <div class="dual-upload">
+        <div>
+          <strong style="font-size:13.5px; display:block; margin-bottom:8px;">Estado de cuenta procesado (.xlsx)</strong>
+          <div class="dropzone dropzone-small" id="dropzoneEstado3">
+            <div class="icon">📄</div>
+            <p><strong>Arrastra o haz clic</strong></p>
+            <button class="browse-btn" id="browseBtnEstado3" type="button">Seleccionar .xlsx</button>
+            <input class="file-input-hidden" id="fileInputEstado3" type="file" accept=".xlsx">
+            <span class="file-name-label" id="fileNameLabelEstado3"></span>
+          </div>
+        </div>
+        <div>
+          <strong style="font-size:13.5px; display:block; margin-bottom:8px;">Facturas procesadas (.xlsx)</strong>
+          <div class="dropzone dropzone-small" id="dropzoneFacturas3">
+            <div class="icon">🧾</div>
+            <p><strong>Arrastra o haz clic</strong></p>
+            <button class="browse-btn" id="browseBtnFacturas3" type="button">Seleccionar .xlsx</button>
+            <input class="file-input-hidden" id="fileInputFacturas3" type="file" accept=".xlsx">
+            <span class="file-name-label" id="fileNameLabelFacturas3"></span>
+          </div>
+        </div>
+      </div>
+      <div id="statusArea3" class="status"></div>
+      <div class="actions">
+        <button class="btn-primary" id="matchBtn3" type="button" disabled>Cruzar facturas</button>
+      </div>
+      <ul class="rules" style="margin-top:16px;">
+        <li>El cruce compara el monto (Charge Amount) de cada movimiento contra el monto total de cada factura, permitiendo hasta 20% de diferencia por propina, y usa la fecha y la razón social como apoyo (no como filtro obligatorio, ya que la razón social fiscal de una factura casi nunca coincide textualmente con el nombre comercial del estado de cuenta).</li>
+        <li>Cada factura solo se usa una vez; se prioriza la coincidencia de monto más cercana.</li>
+        <li>Solo se completa la columna "Factura S/N" cuando está vacía — no se sobrescriben notas que ya hayas escrito a mano.</li>
+        <li>Cuando la coincidencia no es exacta se indica "(±propina X%)" para que sepas que fue por tolerancia y no un monto idéntico.</li>
+      </ul>
+    </div>
+
+    <div class="results-card card" id="resultsArea3">
+      <h2>Resultado del cruce</h2>
+      <div class="summary-row" id="summary3"></div>
+      <div id="warningsBox3" class="warnings-box" style="display:none;"></div>
+
+      <div class="table-wrap" id="tableWrap3"></div>
+
+      <div class="actions">
+        <button class="btn-primary" id="downloadBtn3" type="button">Descargar Estado de Cuenta con facturas (.xlsx)</button>
+        <button class="btn-secondary" id="resetBtn3" type="button">Empezar de nuevo</button>
       </div>
     </div>
   </div>
@@ -670,15 +732,147 @@ if (typeof module !== "undefined") {
 window.Cfdi = { parseCfdiXml, getElementsByLocalName, firstByLocalName, toNumber, FORMA_PAGO_LABELS };
 </script>
 <script>
+/* ==== Matching logic (cruce estado <-> facturas) ==== */
+// Cross-matching logic between a processed "Estado de Cuenta" workbook and a processed
+// "Facturas" (CFDI) workbook. Pure logic, no DOM — reusable from the browser app and tests.
+
+function normText(s) {
+  return String(s == null ? "" : s)
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9 ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+var LEGAL_SUFFIXES = ["SA DE CV", "S DE RL DE CV", "S DE RL", "SAPI DE CV", "SAPI", "SC", "AC", "LLC", "PBC", "INC", "CORP", "CO", "LTD", "PLC"];
+
+function stripLegalSuffixes(normed) {
+  var out = normed;
+  LEGAL_SUFFIXES.forEach(function (suf) {
+    out = out.replace(new RegExp("\\b" + suf + "\\b", "g"), " ");
+  });
+  return out.replace(/\s+/g, " ").trim();
+}
+
+function tokens(s) {
+  return stripLegalSuffixes(normText(s)).split(" ").filter(function (t) { return t.length >= 3; });
+}
+
+// Soft name-similarity score in [0,1]. Real CFDI "Razón social" (fiscal/legal name) often differs
+// completely from the statement's commercial "Supplier Name" (e.g. "VIVAAEROBUS" vs the legal entity
+// "AEROENLACES NACIONALES"), so this is only ever used as a tie-breaking bonus, never a hard filter.
+function nameSimilarity(a, b) {
+  var ta = tokens(a), tb = tokens(b);
+  if (!ta.length || !tb.length) return 0;
+  var setA = {}; ta.forEach(function (t) { setA[t] = true; });
+  var hits = 0;
+  tb.forEach(function (t) { if (setA[t]) hits++; });
+  // also check substring containment for cases like "AEROMEXICO" vs "AEROVIAS DE MEXICO"
+  var aJoined = ta.join(" "), bJoined = tb.join(" ");
+  var substrBonus = (aJoined.indexOf(bJoined) > -1 || bJoined.indexOf(aJoined) > -1) ? 0.3 : 0;
+  return Math.min(1, hits / Math.min(ta.length, tb.length) + substrBonus);
+}
+
+// Parse either "MM/DD/YYYY" (statement) or ISO "YYYY-MM-DDTHH:MM:SS" (CFDI) into a comparable
+// day-granularity timestamp (ms). Returns null if unparseable.
+function parseDateFlexible(s) {
+  if (s == null || s === "") return null;
+  if (s instanceof Date) return Date.UTC(s.getFullYear(), s.getMonth(), s.getDate());
+  var str = String(s).trim();
+  var iso = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return Date.UTC(+iso[1], +iso[2] - 1, +iso[3]);
+  var mdY = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (mdY) return Date.UTC(+mdY[3], +mdY[1] - 1, +mdY[2]);
+  return null;
+}
+
+function daysBetween(ts1, ts2) {
+  if (ts1 == null || ts2 == null) return null;
+  return Math.abs(ts1 - ts2) / 86400000;
+}
+
+var AMOUNT_TOLERANCE = 0.20; // ±20% — covers the "propina" (tip) variance the user described.
+var EXACT_TOLERANCE = 0.015; // within 1.5% counts as an "exact" match (rounding-level noise only).
+var MAX_DATE_DIFF_DAYS = 7; // hard cutoff to avoid coincidental amount matches far apart in time.
+
+// CFDI invoices are almost always MXN-denominated; a blank/unknown currency (e.g. an older
+// Facturas export generated before the "Moneda" column existed) is assumed to be MXN rather than
+// treated as a wildcard — otherwise a USD statement charge (e.g. a USD-billed SaaS subscription)
+// could spuriously match an unrelated MXN invoice just because neither side declared a currency.
+function normCurrency(c) {
+  var v = String(c || "").trim().toUpperCase();
+  return v || "MXN";
+}
+
+// statementRows: [{ id, chargeAmount, supplierName, currency, dateTs }]
+// invoices: [{ id, total, razonSocial, currency, dateTs }]
+// Returns { matches: [{ statementId, invoiceId, diffPct, matchType, nameScore }], unmatchedStatementIds, unmatchedInvoiceIds }
+function matchStatementToInvoices(statementRows, invoices) {
+  var candidates = [];
+  statementRows.forEach(function (st) {
+    if (!st.chargeAmount || st.chargeAmount <= 0) return;
+    invoices.forEach(function (inv) {
+      if (!inv.total || inv.total <= 0) return;
+      if (normCurrency(st.currency) !== normCurrency(inv.currency)) return; // don't cross currencies
+      var diffPct = Math.abs(inv.total - st.chargeAmount) / st.chargeAmount;
+      if (diffPct > AMOUNT_TOLERANCE) return;
+      var dDays = daysBetween(st.dateTs, inv.dateTs);
+      if (dDays != null && dDays > MAX_DATE_DIFF_DAYS) return;
+      var nameScore = nameSimilarity(st.supplierName, inv.razonSocial);
+      // An amount+date match within the "tolerancia" band (not near-exact) is coincidental often
+      // enough that it needs at least a little name corroboration — otherwise two unrelated charges
+      // that happen to land within 20%/7 days of each other look like a match. Near-exact amount
+      // matches don't need this, since the fiscal "razón social" legitimately differs from the
+      // statement's trade name (e.g. VIVAAEROBUS vs its legal entity AEROENLACES NACIONALES).
+      if (diffPct > EXACT_TOLERANCE && nameScore <= 0) return;
+      // Composite score: lower is better. Amount closeness dominates; date and name break ties.
+      var score = diffPct * 10 + (dDays == null ? 1 : dDays / 100) - nameScore * 0.05;
+      candidates.push({ statementId: st.id, invoiceId: inv.id, diffPct: diffPct, dDays: dDays, nameScore: nameScore, score: score });
+    });
+  });
+
+  candidates.sort(function (a, b) { return a.score - b.score; });
+
+  var usedStatement = {}, usedInvoice = {};
+  var matches = [];
+  candidates.forEach(function (c) {
+    if (usedStatement[c.statementId] || usedInvoice[c.invoiceId]) return;
+    usedStatement[c.statementId] = true;
+    usedInvoice[c.invoiceId] = true;
+    matches.push({
+      statementId: c.statementId,
+      invoiceId: c.invoiceId,
+      diffPct: c.diffPct,
+      matchType: c.diffPct <= EXACT_TOLERANCE ? "exacto" : "tolerancia",
+      nameScore: c.nameScore
+    });
+  });
+
+  var unmatchedStatementIds = statementRows.filter(function (s) { return !usedStatement[s.id]; }).map(function (s) { return s.id; });
+  var unmatchedInvoiceIds = invoices.filter(function (i) { return !usedInvoice[i.id]; }).map(function (i) { return i.id; });
+
+  return { matches: matches, unmatchedStatementIds: unmatchedStatementIds, unmatchedInvoiceIds: unmatchedInvoiceIds };
+}
+
+if (typeof module !== "undefined") {
+  module.exports = { normText, tokens, nameSimilarity, parseDateFlexible, daysBetween, matchStatementToInvoices, AMOUNT_TOLERANCE, EXACT_TOLERANCE, MAX_DATE_DIFF_DAYS };
+}
+
+window.Matching = { normText, tokens, nameSimilarity, parseDateFlexible, daysBetween, matchStatementToInvoices, AMOUNT_TOLERANCE, EXACT_TOLERANCE, MAX_DATE_DIFF_DAYS };
+</script>
+<script>
 /* ==== Tab switcher ==== */
 (function () {
   var buttons = document.querySelectorAll(".tab-btn");
+  var panels = { estado: "panel-estado", facturas: "panel-facturas", cruce: "panel-cruce" };
   buttons.forEach(function (btn) {
     btn.addEventListener("click", function () {
       var tab = btn.getAttribute("data-tab");
       document.querySelectorAll(".tab-btn").forEach(function (b) { b.classList.toggle("active", b === btn); });
-      document.getElementById("panel-estado").classList.toggle("active", tab === "estado");
-      document.getElementById("panel-facturas").classList.toggle("active", tab === "facturas");
+      Object.keys(panels).forEach(function (key) {
+        document.getElementById(panels[key]).classList.toggle("active", tab === key);
+      });
     });
   });
 })();
@@ -1160,6 +1354,7 @@ window.Cfdi = { parseCfdiXml, getElementsByLocalName, firstByLocalName, toNumber
     { key: "emisorRfc", label: "RFC emisor" },
     { key: "fecha", label: "Fecha" },
     { key: "formaPago", label: "Forma de pago" },
+    { key: "moneda", label: "Moneda" },
     { key: "subtotal", label: "Subtotal", money: true },
     { key: "iva", label: "IVA", money: true },
     { key: "propina", label: "Propina", money: true },
@@ -1318,6 +1513,437 @@ window.Cfdi = { parseCfdiXml, getElementsByLocalName, firstByLocalName, toNumber
     els.fileNameLabel.textContent = "";
     els.resultsArea.style.display = "none";
     showStatus("", "");
+  });
+})();
+
+</script>
+<script>
+/* ==== App glue: cruce ==== */
+(function () {
+  "use strict";
+
+  var els = {
+    dropzoneEstado: document.getElementById("dropzoneEstado3"),
+    fileInputEstado: document.getElementById("fileInputEstado3"),
+    browseBtnEstado: document.getElementById("browseBtnEstado3"),
+    fileNameLabelEstado: document.getElementById("fileNameLabelEstado3"),
+
+    dropzoneFacturas: document.getElementById("dropzoneFacturas3"),
+    fileInputFacturas: document.getElementById("fileInputFacturas3"),
+    browseBtnFacturas: document.getElementById("browseBtnFacturas3"),
+    fileNameLabelFacturas: document.getElementById("fileNameLabelFacturas3"),
+
+    statusArea: document.getElementById("statusArea3"),
+    matchBtn: document.getElementById("matchBtn3"),
+
+    resultsArea: document.getElementById("resultsArea3"),
+    summary: document.getElementById("summary3"),
+    warningsBox: document.getElementById("warningsBox3"),
+    tableWrap: document.getElementById("tableWrap3"),
+    downloadBtn: document.getElementById("downloadBtn3"),
+    resetBtn: document.getElementById("resetBtn3")
+  };
+
+  var state = {
+    estadoWorkbook: null, estadoFileName: null, estadoSheet: null, estadoCols: null, estadoRows: null,
+    facturasWorkbook: null, facturasFileName: null, facturasRows: null,
+    matchResult: null
+  };
+
+  function showStatus(message, kind) {
+    els.statusArea.textContent = message || "";
+    els.statusArea.className = "status " + (kind || "");
+    els.statusArea.style.display = message ? "block" : "none";
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function fmtMoney(n) {
+    return (n || 0).toLocaleString("es-MX", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function readFileAsArrayBuffer(file) {
+    return file.arrayBuffer ? file.arrayBuffer() : new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(reader.result); };
+      reader.onerror = reject;
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  function findCol(headerCells, aliases) {
+    for (var i = 0; i < headerCells.length; i++) {
+      var norm = Core.normHeader(headerCells[i] || "");
+      for (var j = 0; j < aliases.length; j++) {
+        if (norm === Core.normHeader(aliases[j])) return i + 1; // 1-based column index for ExcelJS
+      }
+    }
+    return -1;
+  }
+
+  function headerCellsOf(sheet) {
+    var row = sheet.getRow(1);
+    var cells = [];
+    for (var c = 1; c <= Math.max(row.cellCount, sheet.columnCount || 0); c++) {
+      cells.push(row.getCell(c).value || "");
+    }
+    return cells;
+  }
+
+  // ---- Estado de Cuenta workbook ----
+  async function loadEstadoFile(file) {
+    var buf = await readFileAsArrayBuffer(file);
+    var wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf);
+
+    var sheet = null, cols = null;
+    for (var i = 0; i < wb.worksheets.length; i++) {
+      var candidate = wb.worksheets[i];
+      var headerCells = headerCellsOf(candidate);
+      var supplierIdx = findCol(headerCells, ["Supplier Name"]);
+      var chargeIdx = findCol(headerCells, ["Charge Amount"]);
+      if (supplierIdx > -1 && chargeIdx > -1) {
+        sheet = candidate;
+        cols = {
+          lastName: findCol(headerCells, ["Last Name"]),
+          supplierName: supplierIdx,
+          chargeAmount: chargeIdx,
+          chargeDate: findCol(headerCells, ["Charge Date"]),
+          currency: findCol(headerCells, ["Submitted Currency"]),
+          facturaSn: findCol(headerCells, ["Factura S/N"]),
+          justificacion: findCol(headerCells, ["Justificación", "Justificacion"])
+        };
+        break;
+      }
+    }
+    if (!sheet) throw new Error("No se encontró una hoja con las columnas 'Supplier Name' y 'Charge Amount' en el Excel del estado de cuenta. ¿Es el archivo procesado en la pestaña 1?");
+    if (cols.facturaSn === -1) throw new Error("No se encontró la columna 'Factura S/N' en el Excel del estado de cuenta.");
+
+    var rows = [];
+    for (var r = 2; r <= sheet.rowCount; r++) {
+      var row = sheet.getRow(r);
+      var supplierName = row.getCell(cols.supplierName).value;
+      var chargeAmountRaw = row.getCell(cols.chargeAmount).value;
+      if ((supplierName == null || supplierName === "") && (chargeAmountRaw == null || chargeAmountRaw === "")) continue; // skip fully blank rows
+      var chargeAmount = typeof chargeAmountRaw === "number" ? chargeAmountRaw : parseFloat(String(chargeAmountRaw || "").replace(/,/g, "")) || 0;
+      rows.push({
+        id: "st" + r,
+        rowNumber: r,
+        lastName: cols.lastName > -1 ? row.getCell(cols.lastName).value : "",
+        supplierName: supplierName || "",
+        chargeAmount: chargeAmount,
+        chargeDateRaw: cols.chargeDate > -1 ? row.getCell(cols.chargeDate).value : "",
+        dateTs: cols.chargeDate > -1 ? Matching.parseDateFlexible(row.getCell(cols.chargeDate).value) : null,
+        currency: cols.currency > -1 ? String(row.getCell(cols.currency).value || "").trim().toUpperCase() : "",
+        currentFacturaSn: row.getCell(cols.facturaSn).value || ""
+      });
+    }
+
+    state.estadoWorkbook = wb;
+    state.estadoSheet = sheet;
+    state.estadoCols = cols;
+    state.estadoRows = rows;
+    state.estadoFileName = file.name;
+  }
+
+  // ---- Facturas workbook ----
+  async function loadFacturasFile(file) {
+    var buf = await readFileAsArrayBuffer(file);
+    var wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf);
+
+    var sheet = null, cols = null;
+    for (var i = 0; i < wb.worksheets.length; i++) {
+      var candidate = wb.worksheets[i];
+      var headerCells = headerCellsOf(candidate);
+      var razonIdx = findCol(headerCells, ["Razón social", "Razon social"]);
+      var totalIdx = findCol(headerCells, ["Monto (Total)", "Monto Total", "Total"]);
+      if (razonIdx > -1 && totalIdx > -1) {
+        sheet = candidate;
+        cols = {
+          razonSocial: razonIdx,
+          rfc: findCol(headerCells, ["RFC emisor"]),
+          fecha: findCol(headerCells, ["Fecha"]),
+          total: totalIdx,
+          uuid: findCol(headerCells, ["Folio/UUID"]),
+          moneda: findCol(headerCells, ["Moneda"])
+        };
+        break;
+      }
+    }
+    if (!sheet) throw new Error("No se encontró una hoja con las columnas 'Razón social' y 'Monto (Total)' en el Excel de facturas. ¿Es el archivo procesado en la pestaña 2?");
+
+    var rows = [];
+    for (var r = 2; r <= sheet.rowCount; r++) {
+      var row = sheet.getRow(r);
+      var razonSocial = row.getCell(cols.razonSocial).value;
+      var rfc = cols.rfc > -1 ? row.getCell(cols.rfc).value : "";
+      var totalRaw = row.getCell(cols.total).value;
+      if (razonSocial === "TOTAL" && !rfc) continue; // the totals row appended by tab 2's export
+      if (razonSocial == null || razonSocial === "") continue;
+      var total = typeof totalRaw === "number" ? totalRaw : parseFloat(String(totalRaw || "").replace(/,/g, "")) || 0;
+      if (total <= 0) continue;
+      rows.push({
+        id: "inv" + r,
+        rowNumber: r,
+        razonSocial: razonSocial,
+        rfc: rfc || "",
+        total: total,
+        dateTs: cols.fecha > -1 ? Matching.parseDateFlexible(row.getCell(cols.fecha).value) : null,
+        uuid: cols.uuid > -1 ? (row.getCell(cols.uuid).value || "") : "",
+        currency: cols.moneda > -1 ? String(row.getCell(cols.moneda).value || "").trim().toUpperCase() : ""
+      });
+    }
+
+    state.facturasWorkbook = wb;
+    state.facturasRows = rows;
+    state.facturasFileName = file.name;
+  }
+
+  function checkReady() {
+    els.matchBtn.disabled = !(state.estadoRows && state.facturasRows);
+  }
+
+  async function handleEstadoFile(file) {
+    els.fileNameLabelEstado.textContent = file.name;
+    showStatus("Leyendo \"" + file.name + "\"...", "info");
+    try {
+      await loadEstadoFile(file);
+      showStatus("Estado de cuenta cargado (" + state.estadoRows.length + " movimientos). " + (state.facturasRows ? "Listo para cruzar." : "Ahora carga el Excel de facturas."), "success");
+    } catch (err) {
+      console.error(err);
+      showStatus("Error: " + err.message, "error");
+    }
+    checkReady();
+  }
+
+  async function handleFacturasFile(file) {
+    els.fileNameLabelFacturas.textContent = file.name;
+    showStatus("Leyendo \"" + file.name + "\"...", "info");
+    try {
+      await loadFacturasFile(file);
+      showStatus("Facturas cargadas (" + state.facturasRows.length + " facturas). " + (state.estadoRows ? "Listo para cruzar." : "Ahora carga el Excel del estado de cuenta."), "success");
+    } catch (err) {
+      console.error(err);
+      showStatus("Error: " + err.message, "error");
+    }
+    checkReady();
+  }
+
+  function wireDropzone(dropzoneEl, inputEl, browseBtnEl, handler) {
+    browseBtnEl.addEventListener("click", function () { inputEl.click(); });
+    inputEl.addEventListener("change", function (e) {
+      if (e.target.files && e.target.files[0]) handler(e.target.files[0]);
+    });
+    ["dragenter", "dragover"].forEach(function (evt) {
+      dropzoneEl.addEventListener(evt, function (e) { e.preventDefault(); e.stopPropagation(); dropzoneEl.classList.add("drag"); });
+    });
+    ["dragleave", "drop"].forEach(function (evt) {
+      dropzoneEl.addEventListener(evt, function (e) { e.preventDefault(); e.stopPropagation(); dropzoneEl.classList.remove("drag"); });
+    });
+    dropzoneEl.addEventListener("drop", function (e) {
+      var files = e.dataTransfer && e.dataTransfer.files;
+      if (files && files[0]) handler(files[0]);
+    });
+    dropzoneEl.addEventListener("click", function () { inputEl.click(); });
+  }
+
+  wireDropzone(els.dropzoneEstado, els.fileInputEstado, els.browseBtnEstado, handleEstadoFile);
+  wireDropzone(els.dropzoneFacturas, els.fileInputFacturas, els.browseBtnFacturas, handleFacturasFile);
+
+  function runMatch() {
+    var statementCandidates = state.estadoRows.filter(function (r) { return r.chargeAmount > 0; });
+    var invoiceCandidates = state.facturasRows;
+    var result = Matching.matchStatementToInvoices(statementCandidates, invoiceCandidates);
+
+    var byStatementId = {};
+    result.matches.forEach(function (m) { byStatementId[m.statementId] = m; });
+    var invoiceById = {};
+    invoiceCandidates.forEach(function (inv) { invoiceById[inv.id] = inv; });
+
+    var writtenCount = 0, skippedAlreadyFilled = 0;
+    state.estadoRows.forEach(function (st) {
+      var m = byStatementId[st.id];
+      if (!m) { st._matchOutcome = null; return; }
+      var inv = invoiceById[m.invoiceId];
+      var note = inv.uuid ? String(inv.uuid) : "Factura encontrada";
+      if (m.matchType === "tolerancia") {
+        note += " (±propina " + Math.round(m.diffPct * 100) + "%)";
+      }
+      st._matchOutcome = { matchType: m.matchType, diffPct: m.diffPct, invoice: inv, note: note };
+      if (st.currentFacturaSn && String(st.currentFacturaSn).trim() !== "") {
+        skippedAlreadyFilled++;
+      } else {
+        writtenCount++;
+      }
+    });
+
+    state.matchResult = result;
+    state.writtenCount = writtenCount;
+    state.skippedAlreadyFilled = skippedAlreadyFilled;
+    state.invoiceById = invoiceById;
+  }
+
+  function renderSummary() {
+    var exact = state.estadoRows.filter(function (r) { return r._matchOutcome && r._matchOutcome.matchType === "exacto"; }).length;
+    var tolerance = state.estadoRows.filter(function (r) { return r._matchOutcome && r._matchOutcome.matchType === "tolerancia"; }).length;
+    var none = state.estadoRows.filter(function (r) { return r.chargeAmount > 0 && !r._matchOutcome; }).length;
+    els.summary.innerHTML =
+      '<div class="stat"><strong>' + exact + '</strong><span>Factura exacta</span></div>' +
+      '<div class="stat"><strong>' + tolerance + '</strong><span>Factura con tolerancia (propina)</span></div>' +
+      '<div class="stat"><strong>' + none + '</strong><span>Sin factura encontrada</span></div>' +
+      '<div class="stat"><strong>' + state.matchResult.unmatchedInvoiceIds.length + '</strong><span>Facturas sin usar</span></div>';
+  }
+
+  function renderWarnings() {
+    var warnings = [];
+    if (state.skippedAlreadyFilled > 0) {
+      warnings.push(state.skippedAlreadyFilled + " movimiento(s) ya tenían un valor en \"Factura S/N\" y no se modificaron.");
+    }
+    if (state.matchResult.unmatchedInvoiceIds.length > 0) {
+      var names = state.matchResult.unmatchedInvoiceIds.slice(0, 8).map(function (id) { return state.invoiceById[id].razonSocial; });
+      warnings.push(state.matchResult.unmatchedInvoiceIds.length + " factura(s) no se pudieron relacionar con ningún movimiento (revisa si son de otro periodo o gasto no reflejado en el estado de cuenta): " + names.join(", ") + (state.matchResult.unmatchedInvoiceIds.length > 8 ? ", ..." : "") + ".");
+    }
+    if (!warnings.length) {
+      els.warningsBox.style.display = "none";
+      els.warningsBox.innerHTML = "";
+      return;
+    }
+    els.warningsBox.style.display = "block";
+    els.warningsBox.innerHTML = "<strong>Avisos:</strong><ul>" + warnings.map(function (w) { return "<li>" + escapeHtml(w) + "</li>"; }).join("") + "</ul>";
+  }
+
+  function badgeFor(row) {
+    if (!row._matchOutcome) return row.chargeAmount > 0 ? '<span class="badge badge-none">Sin factura</span>' : "";
+    if (row._matchOutcome.matchType === "exacto") return '<span class="badge badge-exact">Exacta</span>';
+    return '<span class="badge badge-tolerance">±' + Math.round(row._matchOutcome.diffPct * 100) + '% propina</span>';
+  }
+
+  function renderTable() {
+    var thead = "<thead><tr><th>Titular</th><th>Proveedor (estado de cuenta)</th><th>Fecha</th><th>Monto</th><th>Coincidencia</th><th>Factura relacionada</th><th>Factura S/N (a escribir)</th></tr></thead>";
+    var rowsHtml = state.estadoRows.map(function (r) {
+      var relacionada = r._matchOutcome ? escapeHtml(r._matchOutcome.invoice.razonSocial) + " — $" + fmtMoney(r._matchOutcome.invoice.total) : "";
+      var toWrite = r._matchOutcome ? (r.currentFacturaSn ? "(ya tenía valor, no se tocó)" : escapeHtml(r._matchOutcome.note)) : "";
+      return "<tr>" +
+        "<td>" + escapeHtml(r.lastName) + "</td>" +
+        "<td>" + escapeHtml(r.supplierName) + "</td>" +
+        "<td>" + escapeHtml(r.chargeDateRaw) + "</td>" +
+        "<td>$" + fmtMoney(r.chargeAmount) + "</td>" +
+        "<td>" + badgeFor(r) + "</td>" +
+        "<td>" + relacionada + "</td>" +
+        "<td>" + toWrite + "</td>" +
+        "</tr>";
+    }).join("");
+    els.tableWrap.innerHTML = "<table>" + thead + "<tbody>" + rowsHtml + "</tbody></table>";
+  }
+
+  function writeIntoWorkbook() {
+    var cols = state.estadoCols;
+    var sheet = state.estadoSheet;
+    state.estadoRows.forEach(function (r) {
+      if (!r._matchOutcome) return;
+      if (r.currentFacturaSn && String(r.currentFacturaSn).trim() !== "") return; // don't clobber manual entries
+      var cell = sheet.getRow(r.rowNumber).getCell(cols.facturaSn);
+      cell.value = r._matchOutcome.note;
+      if (r._matchOutcome.matchType === "tolerancia" && cols.justificacion > -1) {
+        var justCell = sheet.getRow(r.rowNumber).getCell(cols.justificacion);
+        if (!justCell.value) {
+          justCell.value = "Posible propina: la factura difiere " + Math.round(r._matchOutcome.diffPct * 100) + "% del monto del estado de cuenta.";
+        }
+      }
+    });
+
+    // Append a "Cruce de Facturas" summary sheet for a full audit trail.
+    var wb = state.estadoWorkbook;
+    var existing = wb.getWorksheet("Cruce de Facturas");
+    if (existing) wb.removeWorksheet(existing.id);
+    var cruceSheet = wb.addWorksheet("Cruce de Facturas");
+
+    cruceSheet.addRow(["Movimientos con factura encontrada"]).font = { bold: true, size: 13 };
+    var header = cruceSheet.addRow(["Titular", "Proveedor", "Fecha", "Monto estado de cuenta", "Coincidencia", "Razón social factura", "Monto factura", "Diferencia %", "Folio/UUID"]);
+    header.font = { bold: true };
+    state.estadoRows.forEach(function (r) {
+      if (!r._matchOutcome) return;
+      cruceSheet.addRow([
+        r.lastName, r.supplierName, r.chargeDateRaw, r.chargeAmount,
+        r._matchOutcome.matchType === "exacto" ? "Exacta" : "Con tolerancia (propina)",
+        r._matchOutcome.invoice.razonSocial, r._matchOutcome.invoice.total,
+        Math.round(r._matchOutcome.diffPct * 1000) / 10, r._matchOutcome.invoice.uuid
+      ]);
+    });
+
+    cruceSheet.addRow([]);
+    cruceSheet.addRow(["Facturas que no se relacionaron con ningún movimiento"]).font = { bold: true, size: 13 };
+    var header2 = cruceSheet.addRow(["Razón social", "RFC", "Monto", "Fecha", "Folio/UUID"]);
+    header2.font = { bold: true };
+    state.matchResult.unmatchedInvoiceIds.forEach(function (id) {
+      var inv = state.invoiceById[id];
+      cruceSheet.addRow([inv.razonSocial, inv.rfc, inv.total, "", inv.uuid]);
+    });
+
+    cruceSheet.columns.forEach(function (col) { col.width = 26; });
+  }
+
+  els.matchBtn.addEventListener("click", async function () {
+    els.matchBtn.disabled = true;
+    els.matchBtn.textContent = "Cruzando...";
+    try {
+      runMatch();
+      writeIntoWorkbook();
+      renderSummary();
+      renderWarnings();
+      renderTable();
+      els.resultsArea.style.display = "block";
+      showStatus("Cruce completado.", "success");
+    } catch (err) {
+      console.error(err);
+      showStatus("Error durante el cruce: " + err.message, "error");
+    } finally {
+      els.matchBtn.disabled = false;
+      els.matchBtn.textContent = "Cruzar facturas";
+    }
+  });
+
+  els.downloadBtn.addEventListener("click", async function () {
+    if (!state.estadoWorkbook) return;
+    els.downloadBtn.disabled = true;
+    els.downloadBtn.textContent = "Generando...";
+    try {
+      var buffer = await state.estadoWorkbook.xlsx.writeBuffer();
+      var blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      var base = (state.estadoFileName || "estado_de_cuenta").replace(/\.[^.]+$/, "");
+      a.href = url;
+      a.download = base + "_con_facturas.xlsx";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+    } catch (err) {
+      console.error(err);
+      showStatus("Error al generar el Excel: " + err.message, "error");
+    } finally {
+      els.downloadBtn.disabled = false;
+      els.downloadBtn.textContent = "Descargar Estado de Cuenta con facturas (.xlsx)";
+    }
+  });
+
+  els.resetBtn.addEventListener("click", function () {
+    state.estadoWorkbook = null; state.estadoRows = null; state.estadoFileName = null;
+    state.facturasWorkbook = null; state.facturasRows = null; state.facturasFileName = null;
+    state.matchResult = null;
+    els.fileInputEstado.value = "";
+    els.fileInputFacturas.value = "";
+    els.fileNameLabelEstado.textContent = "";
+    els.fileNameLabelFacturas.textContent = "";
+    els.resultsArea.style.display = "none";
+    showStatus("", "");
+    checkReady();
   });
 })();
 
